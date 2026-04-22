@@ -1,0 +1,15 @@
+from __future__ import annotations
+
+from enum import Enum
+
+
+class EventType(str, Enum):
+    ATTACK = "ATTACK"
+    DAMAGE = "DAMAGE"
+    PERIODIC_APPLY = "PERIODIC_APPLY"
+    PERIODIC_TICK = "PERIODIC_TICK"
+    PERIODIC_EXPIRE = "PERIODIC_EXPIRE"
+    BUFF_APPLY = "BUFF_APPLY"
+    BUFF_EXPIRE = "BUFF_EXPIRE"
+    COOLDOWN_RESET = "COOLDOWN_RESET"
+    COOLDOWN_MODIFY = "COOLDOWN_MODIFY"

@@ -1,0 +1,2 @@
+[console_scripts]
+run-simulation = minimal_sim_core.main:main
