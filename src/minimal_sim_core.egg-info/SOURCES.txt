@@ -1,10 +1,17 @@
 pyproject.toml
 src/minimal_sim_core/__init__.py
+src/minimal_sim_core/api.py
+src/minimal_sim_core/constants.py
+src/minimal_sim_core/contract_examples.py
 src/minimal_sim_core/damage_pipeline.py
 src/minimal_sim_core/event.py
 src/minimal_sim_core/event_types.py
 src/minimal_sim_core/main.py
 src/minimal_sim_core/metrics.py
+src/minimal_sim_core/periodic_effect.py
+src/minimal_sim_core/schema.py
+src/minimal_sim_core/schema_export.py
+src/minimal_sim_core/server.py
 src/minimal_sim_core/simulation_core.py
 src/minimal_sim_core/timeline.py
 src/minimal_sim_core/world_state.py
@@ -12,5 +19,8 @@ src/minimal_sim_core.egg-info/PKG-INFO
 src/minimal_sim_core.egg-info/SOURCES.txt
 src/minimal_sim_core.egg-info/dependency_links.txt
 src/minimal_sim_core.egg-info/entry_points.txt
+src/minimal_sim_core.egg-info/requires.txt
 src/minimal_sim_core.egg-info/top_level.txt
+tests/test_api_entry.py
 tests/test_damage_pipeline.py
+tests/test_periodic_effects.py

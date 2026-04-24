@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
+
 from dataclasses import asdict
 from typing import Dict, Optional
 
 from .constants import PROTOCOL_VERSION, SimulationErrorCode
 from .periodic_effect import PeriodicEffectDefinition
 from .schema import (
+    BattleContext,
+    EFFECT_SLOT_ROUTING,
     GlobalConfig,
     ItemConfig,
     ItemConfigDict,
@@ -14,6 +18,8 @@ from .schema import (
     SkillConfigDict,
     SimulationConfigDict,
     UnitApiConfig,
+    validate_contextual_effects,
+    ConfigValidationError,
 )
 from .simulation_core import SimulationCore
 from .world_state import (
@@ -22,27 +28,30 @@ from .world_state import (
     CooldownState,
     DamageType,
     DummyTargetRuntime,
+    EnchantmentData,
     SimulationConfig,
     SimulationScenario,
     UnitConfig,
 )
 
 
-class ConfigValidationError(ValueError):
-    pass
-
-
 _REQUIRED_UNIT_FIELDS = {
     "unit_id",
-    "base_damage",
     "base_attack_cooldown",
-    "crit_chance",
-    "max_health",
-    "initial_shield",
-    "initial_heal_pool",
+    "battle_context",
 }
+_REQUIRED_BATTLE_CONTEXT_FIELDS = {"self_hp", "self_shield", "enemy_hp"}
 _DEPRECATED_KEYS: list[tuple[str, str]] = []
 _ALLOWED_TOP_LEVEL_KEYS = {"global_config", "unit_config", "item_configs", "skill_configs"}
+
+# Legacy fields that are silently accepted for migration but no longer required
+_LEGACY_UNIT_FIELDS = {"base_damage", "crit_chance", "max_health", "initial_shield", "initial_heal_pool"}
+
+# Global config fields that are deprecated in favor of BattleContext
+_DEPRECATED_GLOBAL_FIELDS = {
+    "dummy_target_health": "BattleContext.enemy_hp",
+    "dummy_target_shield": "BattleContext.self_shield",
+}
 
 
 def simulate(config: dict) -> dict:
@@ -66,8 +75,8 @@ def simulate(config: dict) -> dict:
         response_data = {
             "summary": summary,
             "charts": result.world_state.metrics.generate_chart_points(
-                initial_hp=normalized["global_config"]["dummy_target_health"],
-                initial_shield=normalized["global_config"]["dummy_target_shield"],
+                initial_hp=normalized["unit_config"]["battle_context"]["enemy_hp"],
+                initial_shield=normalized["unit_config"]["battle_context"]["self_shield"],
                 max_points=300,
             ),
             "input_echo": normalized,
@@ -113,6 +122,8 @@ def _format_error(
 def _map_config_error(message: str) -> SimulationErrorCode:
     if message == "missing required field: unit_config" or message.startswith("missing required unit_config fields"):
         return SimulationErrorCode.MISSING_UNIT_CONFIG
+    if "battle_context" in message:
+        return SimulationErrorCode.MISSING_UNIT_CONFIG
     invalid_markers = (
         "must be > 0",
         "must be >= 0",
@@ -124,6 +135,8 @@ def _map_config_error(message: str) -> SimulationErrorCode:
     )
     if any(marker in message for marker in invalid_markers):
         return SimulationErrorCode.INVALID_NUMERIC_VALUE
+    if "enchantment_type" in message or "contextual_effects" in message:
+        return SimulationErrorCode.CONFIG_VALIDATION_FAILED
     return SimulationErrorCode.CONFIG_VALIDATION_FAILED
 
 
@@ -138,12 +151,24 @@ def _normalize_config(config: SimulationConfigDict) -> tuple[Dict[str, object], 
 
     if unit_config_raw is None:
         raise ConfigValidationError("missing required field: unit_config")
+
     missing = sorted(_REQUIRED_UNIT_FIELDS.difference(unit_config_raw.keys()))
     if missing:
         raise ConfigValidationError(f"missing required unit_config fields: {', '.join(missing)}")
 
+    battle_ctx_raw = unit_config_raw.get("battle_context")
+    if not isinstance(battle_ctx_raw, dict):
+        raise ConfigValidationError("unit_config.battle_context must be a dict")
+    missing_bc = sorted(_REQUIRED_BATTLE_CONTEXT_FIELDS.difference(battle_ctx_raw.keys()))
+    if missing_bc:
+        raise ConfigValidationError(f"missing required battle_context fields: {', '.join(missing_bc)}")
+
     global_config = GlobalConfig(**global_config_raw)
-    unit_config = UnitApiConfig(**unit_config_raw)
+
+    battle_context = BattleContext(**battle_ctx_raw)
+    unit_filtered = {k: v for k, v in unit_config_raw.items() if k not in _LEGACY_UNIT_FIELDS and k != "battle_context"}
+    unit_config = UnitApiConfig(**unit_filtered, battle_context=battle_context)
+
     _validate_global(global_config)
     _validate_unit(unit_config)
 
@@ -152,15 +177,37 @@ def _normalize_config(config: SimulationConfigDict) -> tuple[Dict[str, object], 
     if not global_config.ignore_unknown_fields:
         warnings.extend(_collect_unknown_field_warnings(config))
 
-    normalized_items = [
-        asdict(ItemConfig(**{**item, "modifiers": ItemModifierConfig(**item.get("modifiers", {}))}))
-        for item in item_configs_raw
-    ]
+    # Validate items and their contextual_effects
+    # If both modifiers and contextual_effects present, contextual_effects wins (Fix 1)
+    normalized_items = []
+    for item_raw in item_configs_raw:
+        enchantment_type = item_raw.get("enchantment_type", "NONE")
+        contextual_effects = item_raw.get("contextual_effects", {})
+        validate_contextual_effects(enchantment_type, contextual_effects)
+
+        modifiers_raw = item_raw.get("modifiers", {})
+        has_contextual = bool(contextual_effects)
+        has_modifiers = any(v not in (0, 0.0, 1, 1.0, None, False, "") for v in modifiers_raw.values()) if modifiers_raw else False
+        if has_contextual and has_modifiers:
+            warnings.append(
+                f"item '{item_raw.get('buff_id', '?')}': both contextual_effects and modifiers present. "
+                f"contextual_effects takes precedence; modifiers is ignored."
+            )
+            modifiers_raw = {}
+
+        item_fields = {k: v for k, v in item_raw.items() if k not in ("modifiers",)}
+        item = ItemConfig(**item_fields, modifiers=ItemModifierConfig(**modifiers_raw))
+        normalized_items.append(asdict(item))
+
     normalized_skills = [asdict(SkillConfig(**skill)) for skill in skill_configs_raw]
 
     return {
         "global_config": asdict(global_config),
-        "unit_config": asdict(unit_config),
+        "unit_config": {
+            "unit_id": unit_config.unit_id,
+            "base_attack_cooldown": unit_config.base_attack_cooldown,
+            "battle_context": asdict(unit_config.battle_context),
+        },
         "item_configs": normalized_items,
         "skill_configs": normalized_skills,
     }, warnings
@@ -170,9 +217,15 @@ def _collect_deprecation_warnings(config: dict) -> list[str]:
     warnings: list[str] = []
     for deprecated_key, replacement_key in _DEPRECATED_KEYS:
         if deprecated_key in config:
-            warnings.append(f"字段 '{deprecated_key}' 将在 v2.0 弃用，请使用 '{replacement_key}' 替代")
+            warnings.append(f"\u5b57\u6bb5 '{deprecated_key}' \u5c06\u5728 v2.0 \u5f03\u7528\uff0c\u8bf7\u4f7f\u7528 '{replacement_key}' \u66ff\u4ee3")
+    unit_raw = config.get("unit_config", {})
+    for legacy_field in sorted(_LEGACY_UNIT_FIELDS.intersection(unit_raw.keys())):
+        warnings.append(f"unit_config.{legacy_field} is deprecated in v6.1 contract and will be ignored")
+    global_raw = config.get("global_config", {})
+    for dep_field, replacement in sorted(_DEPRECATED_GLOBAL_FIELDS.items()):
+        if dep_field in global_raw:
+            warnings.append(f"global_config.{dep_field} is deprecated. Use {replacement} instead")
     return warnings
-
 
 def _collect_unknown_field_warnings(config: dict) -> list[str]:
     warnings: list[str] = []
@@ -183,13 +236,17 @@ def _collect_unknown_field_warnings(config: dict) -> list[str]:
 
 def _build_scenario(normalized: Dict[str, object]) -> SimulationScenario:
     global_config = GlobalConfig(**normalized["global_config"])
-    unit_config = UnitApiConfig(**normalized["unit_config"])
+    unit_raw = normalized["unit_config"]
+    battle_ctx = BattleContext(**unit_raw["battle_context"])
     item_configs_raw = normalized["item_configs"]
     skill_configs_raw = normalized["skill_configs"]
 
     buffs = tuple(_convert_item_config(item) for item in item_configs_raw)
     periodic_effects = tuple(_convert_skill_config(skill) for skill in skill_configs_raw)
-    cooldowns = (CooldownState(owner_id=unit_config.unit_id, base_cooldown=unit_config.base_attack_cooldown),)
+    cooldowns = (CooldownState(owner_id=unit_raw["unit_id"], base_cooldown=unit_raw["base_attack_cooldown"]),)
+
+    dummy_health = global_config.dummy_target_health if math.isfinite(global_config.dummy_target_health) else float(battle_ctx.enemy_hp)
+    dummy_shield = global_config.dummy_target_shield if global_config.dummy_target_shield > 0 else battle_ctx.self_shield
 
     return SimulationScenario(
         config=SimulationConfig(
@@ -200,18 +257,18 @@ def _build_scenario(normalized: Dict[str, object]) -> SimulationScenario:
             max_events=global_config.max_events,
         ),
         unit=UnitConfig(
-            unit_id=unit_config.unit_id,
-            base_damage=unit_config.base_damage,
-            base_attack_cooldown=unit_config.base_attack_cooldown,
-            crit_chance=unit_config.crit_chance,
-            max_health=unit_config.max_health,
-            initial_shield=unit_config.initial_shield,
-            initial_heal_pool=unit_config.initial_heal_pool,
+            unit_id=unit_raw["unit_id"],
+            base_damage=0,
+            base_attack_cooldown=unit_raw["base_attack_cooldown"],
+            crit_chance=0.0,
+            max_health=battle_ctx.self_hp,
+            initial_shield=battle_ctx.self_shield,
+            initial_heal_pool=0,
         ),
         dummy_target=DummyTargetRuntime(
             target_id=global_config.dummy_target_id,
-            current_health=global_config.dummy_target_health,
-            current_shield=global_config.dummy_target_shield,
+            current_health=dummy_health,
+            current_shield=dummy_shield,
         ),
         cooldowns=cooldowns,
         initial_buffs=buffs,
@@ -233,25 +290,57 @@ def _validate_global(cfg: GlobalConfig) -> None:
 
 
 def _validate_unit(cfg: UnitApiConfig) -> None:
-    if cfg.base_damage < 0:
-        raise ConfigValidationError("base_damage must be >= 0")
     if cfg.base_attack_cooldown <= 0:
         raise ConfigValidationError("base_attack_cooldown must be > 0")
-    if not 0.0 <= cfg.crit_chance <= 1.0:
-        raise ConfigValidationError("crit_chance must be between 0 and 1")
-    if cfg.max_health <= 0:
-        raise ConfigValidationError("max_health must be > 0")
-    if cfg.initial_shield < 0 or cfg.initial_heal_pool < 0:
-        raise ConfigValidationError("initial_shield and initial_heal_pool must be >= 0")
+    bc = cfg.battle_context
+    if bc.self_hp <= 0:
+        raise ConfigValidationError("battle_context.self_hp must be > 0")
+    if bc.self_shield < 0:
+        raise ConfigValidationError("battle_context.self_shield must be >= 0")
+    if bc.enemy_hp <= 0:
+        raise ConfigValidationError("battle_context.enemy_hp must be > 0")
 
 
-def _convert_item_config(item_raw: ItemConfigDict) -> BuffDefinition:
+def _build_enchantment_data(enchantment_type: str, contextual_effects: Dict[str, float]) -> EnchantmentData:
+    """Build routed EnchantmentData from contextual_effects using EFFECT_SLOT_ROUTING."""
+    if enchantment_type == "NONE" or not contextual_effects:
+        return EnchantmentData()
+    routed: Dict[str, Dict[str, float]] = {}
+    for slot_name, value in contextual_effects.items():
+        stage = EFFECT_SLOT_ROUTING.get(slot_name)
+        if stage is not None:
+            routed.setdefault(stage, {})[slot_name] = value
+    return EnchantmentData(enchantment_type=enchantment_type, routed_effects=routed)
+
+
+def _convert_item_config(item_raw: ItemConfigDict, warnings: list[str] | None = None) -> BuffDefinition:
+    enchantment_type = item_raw.get("enchantment_type", "NONE")
+    contextual_effects = item_raw.get("contextual_effects", {})
     raw_modifiers = item_raw.get("modifiers", {})
-    item = ItemConfig(**{**item_raw, "modifiers": ItemModifierConfig(**raw_modifiers)})
+
+    # If both contextual_effects and modifiers are present, contextual_effects takes precedence.
+    # modifiers is deprecated when contextual_effects is non-empty.
+    has_contextual = bool(contextual_effects)
+    has_modifiers = any(v not in (0, 0.0, 1, 1.0, None, False, "") for v in raw_modifiers.values()) if raw_modifiers else False
+
+    if has_contextual and has_modifiers and warnings is not None:
+        warnings.append(
+            f"item '{item_raw.get('buff_id', '?')}': both contextual_effects and modifiers present. "
+            f"contextual_effects takes precedence; modifiers is ignored."
+        )
+
+    if has_contextual:
+        raw_modifiers = {}
+
+    item_fields = {k: v for k, v in item_raw.items() if k not in ("modifiers",)}
+    item = ItemConfig(**item_fields, modifiers=ItemModifierConfig(**raw_modifiers))
     modifiers = item.modifiers
     damage_type_override = None
     if modifiers.damage_type_override is not None:
         damage_type_override = DamageType(modifiers.damage_type_override)
+
+    enchantment_data = _build_enchantment_data(enchantment_type, contextual_effects)
+
     return BuffDefinition(
         buff_id=item.buff_id,
         owner_id=item.owner_id,
@@ -269,8 +358,8 @@ def _convert_item_config(item_raw: ItemConfigDict) -> BuffDefinition:
         max_stacks=item.max_stacks,
         stackable=item.stackable,
         loadout_order_index=item.loadout_order_index,
+        enchantment=enchantment_data,
     )
-
 
 def _convert_skill_config(skill_raw: SkillConfigDict) -> PeriodicEffectDefinition:
     skill = SkillConfig(**skill_raw)
