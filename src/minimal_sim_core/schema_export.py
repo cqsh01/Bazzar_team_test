@@ -44,21 +44,23 @@ def generate_json_schema() -> dict:
                 "type": "object",
                 "required": [
                     "unit_id",
-                    "base_damage",
                     "base_attack_cooldown",
-                    "crit_chance",
-                    "max_health",
-                    "initial_shield",
-                    "initial_heal_pool",
+                    "battle_context",
                 ],
                 "properties": {
                     "unit_id": {"type": "string"},
-                    "base_damage": {"type": "integer", "minimum": 0},
                     "base_attack_cooldown": {"type": "number", "exclusiveMinimum": 0},
-                    "crit_chance": {"type": "number", "minimum": 0, "maximum": 1},
-                    "max_health": {"type": "integer", "exclusiveMinimum": 0},
-                    "initial_shield": {"type": "integer", "minimum": 0},
-                    "initial_heal_pool": {"type": "integer", "minimum": 0},
+                    "battle_context": {"$ref": "#/$defs/BattleContext"},
+                },
+                "additionalProperties": True,
+            },
+            "BattleContext": {
+                "type": "object",
+                "required": ["self_hp", "self_shield", "enemy_hp"],
+                "properties": {
+                    "self_hp": {"type": "integer", "exclusiveMinimum": 0},
+                    "self_shield": {"type": "integer", "minimum": 0},
+                    "enemy_hp": {"type": "integer", "exclusiveMinimum": 0},
                 },
                 "additionalProperties": False,
             },
@@ -89,6 +91,18 @@ def generate_json_schema() -> dict:
                     "loadout_order_index": {"type": "integer", "minimum": 0},
                     "max_stacks": {"type": "integer", "minimum": 1},
                     "stackable": {"type": "boolean"},
+                    "enchantment_type": {
+                        "type": "string",
+                        "enum": [
+                            "NONE", "SLOW", "BURN", "POISON", "FLASH", "OBSIDIAN",
+                            "HEAL", "SHIELD", "ACCELERATE", "FREEZE", "CRIT",
+                            "GOLD", "RADIANCE", "EVERGREEN",
+                        ],
+                    },
+                    "contextual_effects": {
+                        "type": "object",
+                        "additionalProperties": {"type": "number"},
+                    },
                     "modifiers": {"$ref": "#/$defs/ItemModifier"},
                 },
                 "additionalProperties": False,
@@ -126,7 +140,6 @@ def generate_json_schema() -> dict:
             },
         },
     }
-
 
 
 def generate_openapi_snippet() -> dict:
